@@ -5,9 +5,9 @@ from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    from .lifecycle import LifecycleError, LifecycleManager
+    from .lifecycle import LifecycleManager
 except ImportError:
-    from lifecycle import LifecycleError, LifecycleManager
+    from lifecycle import LifecycleManager
 
 
 class EngineManagerError(RuntimeError):
@@ -20,6 +20,7 @@ class EngineManager:
     def __init__(self, engine: Any) -> None:
         if engine is None:
             raise TypeError("engine cannot be None")
+
         if not callable(getattr(engine, "register_manager", None)):
             raise TypeError(
                 "engine must provide register_manager(name, manager)"
@@ -30,8 +31,10 @@ class EngineManager:
         self._managers: Dict[str, Any] = {}
         self._dependencies: Dict[str, Tuple[str, ...]] = {}
         self._lifecycle = LifecycleManager()
+
         self._initialized = False
         self._initializing = False
+        self._shutting_down = False
 
     def register_manager(
         self,
@@ -44,20 +47,22 @@ class EngineManager:
         if not isinstance(name, str) or not name.strip():
             raise ValueError("name must be a non-empty string")
 
-        if manager is None:
-            raise TypeError("manager cannot be None")
-
-        if not callable(getattr(manager, "initialize", None)):
-            raise TypeError(f"Manager '{name}' must provide initialize()")
-
-        if not callable(getattr(manager, "close", None)):
-            raise TypeError(f"Manager '{name}' must provide close()")
+        if (
+            manager is None
+            or not callable(getattr(manager, "initialize", None))
+            or not callable(getattr(manager, "close", None))
+        ):
+            raise TypeError(
+                f"Manager '{name}' must provide initialize() and close()"
+            )
 
         if depends_on is None:
-            dependencies = ()
+            dependencies: Tuple[str, ...] = ()
         else:
             if not isinstance(depends_on, (list, tuple)):
-                raise TypeError("depends_on must be a list, tuple, or None")
+                raise TypeError(
+                    "depends_on must be a list, tuple, or None"
+                )
 
             if any(
                 not isinstance(item, str) or not item.strip()
@@ -67,12 +72,21 @@ class EngineManager:
                     "Dependency names must be non-empty strings"
                 )
 
-            dependencies = tuple(dict.fromkeys(depends_on))
+            if len(set(depends_on)) != len(depends_on):
+                raise ValueError(
+                    "Duplicate dependency names are not allowed"
+                )
+
+            dependencies = tuple(depends_on)
 
         with self._lock:
-            if self._initialized or self._initializing:
+            if (
+                self._initialized
+                or self._initializing
+                or self._shutting_down
+            ):
                 raise EngineManagerError(
-                    "Managers can only be registered before initialization"
+                    "Managers can only be registered while stopped"
                 )
 
             if name in self._managers:
@@ -86,6 +100,7 @@ class EngineManager:
                 )
 
             self._engine.register_manager(name, manager)
+
             self._managers[name] = manager
             self._dependencies[name] = dependencies
 
@@ -124,7 +139,7 @@ class EngineManager:
             if indegree[name] == 0
         )
 
-        order = []
+        order: List[str] = []
 
         while ready:
             current = ready.popleft()
@@ -156,32 +171,36 @@ class EngineManager:
             if self._initialized:
                 return
 
-            if self._initializing:
+            if self._initializing or self._shutting_down:
                 raise EngineManagerError(
-                    "Manager initialization is already running"
+                    "A lifecycle operation is already running"
                 )
 
             self._initializing = True
+
+        lifecycle = LifecycleManager()
 
         try:
             order = self._get_initialization_order()
 
             for name in order:
-                self._lifecycle.register(
+                lifecycle.register(
                     name,
                     self._managers[name],
                 )
 
-            self._lifecycle.initialize()
-
-            with self._lock:
-                self._initialized = True
+            lifecycle.initialize()
 
         except Exception:
-            # A failed startup must not leave duplicate lifecycle entries
-            # that prevent a later initialization retry.
-            self._lifecycle = LifecycleManager()
+            with self._lock:
+                self._lifecycle = LifecycleManager()
+
             raise
+
+        else:
+            with self._lock:
+                self._lifecycle = lifecycle
+                self._initialized = True
 
         finally:
             with self._lock:
@@ -194,11 +213,22 @@ class EngineManager:
             if not self._initialized:
                 return
 
+            if self._initializing or self._shutting_down:
+                raise EngineManagerError(
+                    "A lifecycle operation is already running"
+                )
+
+            self._shutting_down = True
+            lifecycle = self._lifecycle
+
         try:
-            self._lifecycle.shutdown()
+            lifecycle.shutdown()
+
         finally:
             with self._lock:
                 self._initialized = False
+                self._lifecycle = LifecycleManager()
+                self._shutting_down = False
 
     def close(self) -> None:
         """Close managers; compatible with the BaseManager interface."""
@@ -226,6 +256,7 @@ class EngineManager:
             return {
                 "initialized": self._initialized,
                 "initializing": self._initializing,
+                "shutting_down": self._shutting_down,
                 "manager_count": len(self._managers),
                 "managers": list(self._managers),
                 "dependencies": {
@@ -233,4 +264,4 @@ class EngineManager:
                     for name, dependencies in self._dependencies.items()
                 },
                 "lifecycle": self._lifecycle.get_status(),
-      }
+            }
