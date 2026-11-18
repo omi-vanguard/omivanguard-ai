@@ -17,10 +17,7 @@ class LifecycleError(RuntimeError):
 
 
 class LifecycleManager:
-    """
-    Starts registered components in registration order
-    and shuts them down in reverse order.
-    """
+    """Initialize components in registration order and close in reverse order."""
 
     def __init__(self) -> None:
         self._lock = RLock()
@@ -29,8 +26,6 @@ class LifecycleManager:
         self._state = "stopped"
 
     def register(self, name: str, component: Any) -> None:
-        """Register a component before lifecycle startup."""
-
         if not isinstance(name, str) or not name.strip():
             raise ValueError("name must be a non-empty string")
 
@@ -40,8 +35,7 @@ class LifecycleManager:
             or not callable(getattr(component, "close", None))
         ):
             raise TypeError(
-                "component must provide callable initialize() "
-                "and close() methods"
+                "component must provide callable initialize() and close()"
             )
 
         with self._lock:
@@ -58,8 +52,6 @@ class LifecycleManager:
             self._components[name] = component
 
     def unregister(self, name: str) -> bool:
-        """Remove a registered component while stopped."""
-
         with self._lock:
             if self._state != "stopped":
                 raise LifecycleError(
@@ -69,8 +61,6 @@ class LifecycleManager:
             return self._components.pop(name, None) is not None
 
     def initialize(self) -> None:
-        """Initialize all components in registration order."""
-
         with self._lock:
             if self._state == "running":
                 return
@@ -83,12 +73,24 @@ class LifecycleManager:
             self._state = "starting"
             components = list(self._components.items())
 
-        initialized = []
-        current_name = None
+        initialized: List[str] = []
+        rollback_failures: List[Tuple[str, Exception]] = []
+        current_name: Optional[str] = None
 
         try:
             for current_name, component in components:
-                component.initialize()
+                try:
+                    component.initialize()
+                except Exception:
+                    # Clean up a component that partially initialized.
+                    try:
+                        component.close()
+                    except Exception as cleanup_exc:
+                        rollback_failures.append(
+                            (current_name, cleanup_exc)
+                        )
+                    raise
+
                 initialized.append(current_name)
 
                 with self._lock:
@@ -98,27 +100,26 @@ class LifecycleManager:
                 self._state = "running"
 
         except Exception as exc:
-            rollback_failures = []
-
             for name in reversed(initialized):
                 try:
                     self._components[name].close()
-                except Exception as rollback_exc:
-                    rollback_failures.append((name, rollback_exc))
+                except Exception as cleanup_exc:
+                    rollback_failures.append(
+                        (name, cleanup_exc)
+                    )
 
             with self._lock:
                 self._initialized = []
                 self._state = "stopped"
 
+            label = current_name if current_name is not None else "<none>"
+
             raise LifecycleError(
-                f"Initialization failed for component "
-                f"'{current_name}': {exc}",
+                f"Initialization failed for component '{label}': {exc}",
                 rollback_failures,
             ) from exc
 
     def shutdown(self) -> None:
-        """Close initialized components in reverse order."""
-
         with self._lock:
             if self._state == "stopped":
                 return
@@ -131,7 +132,7 @@ class LifecycleManager:
             self._state = "stopping"
             initialized = list(self._initialized)
 
-        failures = []
+        failures: List[Tuple[str, Exception]] = []
 
         for name in reversed(initialized):
             try:
@@ -154,11 +155,9 @@ class LifecycleManager:
             )
 
     def get_status(self) -> Dict[str, Any]:
-        """Return the current lifecycle state."""
-
         with self._lock:
             return {
                 "state": self._state,
                 "registered_components": list(self._components),
                 "initialized_components": list(self._initialized),
-                   }
+            }
