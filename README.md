@@ -1,1 +1,0 @@
-# omivanguard-ai
